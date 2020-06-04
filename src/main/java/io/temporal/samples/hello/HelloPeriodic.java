@@ -25,17 +25,21 @@ import io.temporal.activity.ActivityInterface;
 import io.temporal.activity.ActivityOptions;
 import io.temporal.client.DuplicateWorkflowException;
 import io.temporal.client.WorkflowClient;
+import io.temporal.client.WorkflowClientOptions;
 import io.temporal.client.WorkflowException;
 import io.temporal.client.WorkflowOptions;
 import io.temporal.client.WorkflowStub;
 import io.temporal.proto.common.WorkflowExecution;
+import io.temporal.samples.common.MultiClusterWorkflowClient;
 import io.temporal.serviceclient.WorkflowServiceStubs;
+import io.temporal.serviceclient.WorkflowServiceStubsOptions;
 import io.temporal.worker.Worker;
 import io.temporal.worker.WorkerFactory;
 import io.temporal.workflow.Workflow;
 import io.temporal.workflow.WorkflowInterface;
 import io.temporal.workflow.WorkflowMethod;
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.Optional;
 import java.util.Random;
 
@@ -117,27 +121,41 @@ public class HelloPeriodic {
   }
 
   public static void main(String[] args) throws InterruptedException {
-    // gRPC stubs wrapper that talks to the local docker instance of temporal service.
-    WorkflowServiceStubs service = WorkflowServiceStubs.newInstance();
-    // client that can be used to start and signal workflows
-    WorkflowClient client = WorkflowClient.newInstance(service);
+    WorkflowClientOptions clientOptions =
+        WorkflowClientOptions.newBuilder().setNamespace("domain_gd_sre5").build();
 
-    // worker factory that can be used to create workers for specific task lists
-    WorkerFactory factory = WorkerFactory.newInstance(client);
-    // Worker that listens on a task list and hosts both workflow and activity implementations.
-    Worker worker = factory.newWorker(TASK_LIST);
-    // Workflows are stateful. So you need a type to create instances.
-    worker.registerWorkflowImplementationTypes(GreetingWorkflowImpl.class);
-    // Activities are stateless and thread safe. So a shared instance is used.
-    worker.registerActivitiesImplementations(new GreetingActivitiesImpl());
-    // Start listening to the workflow and activity task lists.
-    factory.start();
+    // client that can be used to start and signal workflows
+    String[] targets =
+        Arrays.stream(System.getenv("TEMPORAL_TARGET").split(","))
+            .map(String::trim)
+            .toArray(String[]::new);
+    WorkflowClient client =
+        MultiClusterWorkflowClient.newInstance(
+            targets, WorkflowServiceStubsOptions.getDefaultInstance(), clientOptions);
+
+    for (String t : targets) {
+      WorkflowServiceStubsOptions options =
+          WorkflowServiceStubsOptions.newBuilder().setTarget(t).build();
+      WorkflowServiceStubs service = WorkflowServiceStubs.newInstance(options);
+      WorkflowClient c = WorkflowClient.newInstance(service, clientOptions);
+      // worker factory that can be used to create workers for specific task lists
+      WorkerFactory factory = WorkerFactory.newInstance(c);
+      // Worker that listens on a task list and hosts both workflow and activity implementations.
+      Worker worker = factory.newWorker(TASK_LIST);
+      // Workflows are stateful. So you need a type to create instances.
+      worker.registerWorkflowImplementationTypes(GreetingWorkflowImpl.class);
+      // Activities are stateless and thread safe. So a shared instance is used.
+      worker.registerActivitiesImplementations(new GreetingActivitiesImpl());
+      // Start listening to the workflow and activity task lists.
+      factory.start();
+    }
 
     // To ensure that this daemon type workflow is always running try to start it periodically
     // ignoring the duplicated exception.
     // It is only to protect from application level failures.
     // Failures of a workflow worker don't lead to workflow failures.
     WorkflowExecution execution = null;
+    int attempts = 10;
     while (true) {
       // Print reason of failure of the previous run, before restarting.
       if (execution != null) {
@@ -164,7 +182,9 @@ public class HelloPeriodic {
         System.out.println("Still running as " + e.getExecution());
       } catch (Throwable e) {
         e.printStackTrace();
-        System.exit(1);
+        if (--attempts == 0) {
+          System.exit(1);
+        }
       }
       // This value is so low just for the sample purpose. In production workflow
       // it is usually much higher.
